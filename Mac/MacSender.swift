@@ -733,7 +733,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 // resurrect the very zombie this retry exists to avoid. (Mirrors the
                 // `if stopped` checks in the permission-poll loops above.)
                 if stopped { return }
-                created = await MainActor.run {
+                let make: @MainActor () -> VirtualDisplay? = {
                     guard !self.stopped else { return nil }
                     let restoreOrigin = DisplayArrangement.origin(for: sizeInPoints, device: arrangementKey)
                     // The productID moves with the serial: field data in #206
@@ -753,6 +753,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                                                                       device: arrangementKey)
                                           })
                 }
+                created = await makeAvoidingUnitClash(make)
                 if stopped { throw CancellationError() }
                 if let created {
                     await MainActor.run {
@@ -1076,6 +1077,105 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func ensureActiveDisplay(_ display: VirtualDisplay) throws {
         try Task.checkCancellation()
         guard !stopped, virtualDisplay === display else { throw CancellationError() }
+    }
+
+    /// Every live sender, so a unit clash can renumber its neighbours (#391).
+    /// Main actor only.
+    @MainActor private static let live = NSHashTable<MacSender>.weakObjects()
+
+    /// Set while this sender's display is released so a sibling can take a
+    /// clash-free unit number; capture recovery stays off until it is rebuilt.
+    private var releasedForRenumbering = false
+
+    /// Create a display with `make`, keeping unit numbers unique (#391).
+    ///
+    /// macOS numbers displays by count, so a display rebuilt while a later
+    /// one survives lands on the survivor's number, and the two get crossed.
+    /// Renumber in creation order instead: release the new display and every
+    /// sibling display at or above the clashing number, recreate this one
+    /// first, then let the siblings rebuild after it. A sibling's rebuild
+    /// also replaces the display the clash damaged. This must hold the only
+    /// reference to the display: a rebuild reuses the serial, which fails
+    /// while the old object lives.
+    @MainActor
+    private func makeAvoidingUnitClash(_ make: @MainActor () -> VirtualDisplay?) async -> VirtualDisplay? {
+        Self.live.add(self)
+        var current: VirtualDisplay? = make()
+        guard let id = current?.displayID, let clash = await DisplayUnits.clash(for: id) else { return current }
+        let held = Self.live.allObjects
+            .filter { $0 !== self && !$0.stopped && $0.mode == .extend }
+            .compactMap { sender -> (sender: MacSender, unit: UInt32, display: CGDirectDisplayID)? in
+                guard let displayID = sender.virtualDisplay?.displayID else { return nil }
+                let unit = CGDisplayUnitNumber(displayID)
+                return unit != UInt32.max && unit >= clash.unit ? (sender, unit, displayID) : nil
+            }
+            .sorted { $0.unit < $1.unit }
+        // Only our own displays can be renumbered. A clash with anything
+        // else (a real monitor, a display a stopped session left behind
+        // while asleep) would re-clash on every rebuild and ping-pong.
+        guard held.contains(where: { $0.display == clash.other }) else {
+            Log.info("virtual display \(id) came up on unit \(clash.unit), already held by display "
+                + "\(clash.other), which no live session owns — leaving it (#391)")
+            return current
+        }
+        let siblings = held.map(\.sender)
+        Log.info("virtual display \(id) came up on unit \(clash.unit), already held by display \(clash.other) — "
+            + "renumbering \(siblings.count + 1) display(s) in creation order (#391)")
+        current = nil
+        var released = [id]
+        for sibling in siblings {
+            if let displayID = await sibling.releaseDisplayForRenumbering() { released.append(displayID) }
+        }
+        await DisplayUnits.waitUntilOffline(released)
+        // The siblings are rebuilt whatever happens to this session from
+        // here: one stopped mid-renumber must not strand them displayless.
+        // One at a time, in their old order, each after this display is up.
+        defer {
+            Task { @MainActor in
+                for sibling in siblings { await sibling.rebuildDisplayAfterRenumbering() }
+            }
+        }
+        guard !stopped else { return nil }
+        current = make()
+        if let id = current?.displayID, let clash = await DisplayUnits.clash(for: id) {
+            Log.info("virtual display \(id) still shares unit \(clash.unit) with display \(clash.other) after renumbering")
+        }
+        return current
+    }
+
+    /// Release this session's display so a sibling can renumber (#391).
+    /// Returns the released display's id.
+    @MainActor
+    private func releaseDisplayForRenumbering() async -> CGDirectDisplayID? {
+        // A recovery round or reconfigure in flight holds the display and
+        // would race the rebuild with its own setupExtend: let it finish.
+        for _ in 0..<50 where captureRecoveryInFlight || reconfiguring {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        guard !stopped, !releasedForRenumbering, let displayID = virtualDisplay?.displayID else { return nil }
+        releasedForRenumbering = true
+        invalidateCapturePipeline(discardingLastFrame: true)
+        let retired = stream
+        stream = nil
+        try? await retired?.stopCapture()
+        virtualDisplay = nil
+        return displayID
+    }
+
+    @MainActor
+    private func rebuildDisplayAfterRenumbering() async {
+        guard releasedForRenumbering else { return }
+        // Cleared on entry: a second renumbering caller must not start a
+        // second setupExtend on the same session.
+        releasedForRenumbering = false
+        guard !stopped, let info = lastHello else { return }
+        Log.info("rebuilding display after renumbering (#391)")
+        do {
+            try await setupExtend(info)
+        } catch {
+            Log.info("rebuild after renumbering failed (\(error)) — falling back to capture recovery")
+            scheduleCaptureRecovery()
+        }
     }
 
     /// The virtual display takes a moment to show up in shareable content.
@@ -1418,7 +1518,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// On `queue`: one recovery tick armed by `scheduleCaptureRecovery`.
     private func runCaptureRecoveryRound() {
         captureRecoveryWork = nil
-        guard !stopped, !captureRecoveryInFlight, stream == nil,
+        guard !stopped, !captureRecoveryInFlight, stream == nil, !releasedForRenumbering,
               let hello = lastHello else { return }
         guard consoleCanCapture else {
             if !waitingForConsole {
