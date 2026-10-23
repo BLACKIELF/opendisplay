@@ -132,8 +132,21 @@ function slugify(text) {
   )
 }
 
+function plainText(html) {
+  return html
+    .replace(/<[^>]+>/g, "")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&#39;", "'")
+    .replaceAll("&amp;", "&")
+}
+
+// Returns the page HTML and its outline: the ## and ### headings, for the
+// "On this page" navigation.
 function renderMarkdown(md, base, file) {
   const used = new Map()
+  const toc = []
   const marked = new Marked({ gfm: true })
   marked.use({
     renderer: {
@@ -144,6 +157,7 @@ function renderMarkdown(md, base, file) {
         const n = used.get(id) ?? 0
         used.set(id, n + 1)
         if (n) id = `${id}-${n}`
+        if (depth <= 3) toc.push({ id, depth, text: plainText(inner) })
         return `<h${depth} id="${id}"><a class="h-anchor" href="#${id}">${inner}</a></h${depth}>\n`
       },
       link({ href, title, tokens }) {
@@ -157,10 +171,11 @@ function renderMarkdown(md, base, file) {
       },
     },
   })
-  return marked
+  const html = marked
     .parse(md)
     .replaceAll("<table>", '<div class="tbl-scroll"><table>')
     .replaceAll("</table>", "</table></div>")
+  return { html, toc }
 }
 
 // ---- page shell ------------------------------------------------------------
@@ -181,12 +196,14 @@ function pageHtml(page, i) {
   const next = i < order.length - 1 ? byRoute.get(order[i + 1]) : undefined
   const fullTitle = page.route === "/docs/" ? "OpenDisplay Docs" : `${page.title} · OpenDisplay Docs`
 
+  const { html, toc } = renderMarkdown(page.body, base, page.file)
   const body = renderDoc({
     base,
     route: page.route,
     title: page.title,
     description: page.description,
-    html: renderMarkdown(page.body, base, page.file),
+    html,
+    toc,
     nav,
     breadcrumbs: crumbs,
     prev: prev && { title: prev.nav, route: prev.route },
