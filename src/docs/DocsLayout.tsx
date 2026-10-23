@@ -75,6 +75,7 @@ export default function DocsLayout(p: DocPageProps) {
             <a href={base || "./"}>Home</a>
             <a href={`${base}docs/`}>Docs</a>
             <a href={`${base}docs/linux/`}>Linux</a>
+            <a href={`${base}docs/third-party/`}>Third-party</a>
             <a href={GITHUB_URL}>GitHub</a>
           </div>
         </div>

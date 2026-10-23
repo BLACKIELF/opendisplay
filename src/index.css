@@ -476,6 +476,14 @@ nav.docs-nav { position: static; border: 0; background: none; z-index: auto;
 @media (max-width: 680px) {
   .docs-page nav .links.docs-links { display: flex; gap: 16px; }
   .docs-links a:first-child { display: none; }   /* the brand already links home */
+  .docs-links a { white-space: nowrap; }
+}
+@media (max-width: 440px) {
+  .docs-page nav .links.docs-links { gap: 12px; }
+  .docs-links a:last-child { display: none; }    /* GitHub: still in the footer and "Edit" link */
+}
+@media (max-width: 360px) {
+  .docs-page nav .links.docs-links { gap: 10px; margin-left: 10px; font-size: 0.8rem; }
 }
 @media (max-width: 560px) {
   .docs-pager { grid-template-columns: 1fr; }
