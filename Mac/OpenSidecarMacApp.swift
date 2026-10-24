@@ -211,7 +211,11 @@ final class SenderController: ObservableObject {
 
     @Published var sessions: [DeviceSession] = []
     @Published var discovered: [NWBrowser.Result] = []
+    // Every cabled device: usbmuxd's iPhones and iPads plus adb's Android
+    // devices (udid `adb:<serial>`). The connection policy treats them alike.
     @Published var usbDevices: [UsbmuxDevice] = []
+    private var usbmuxDevices: [UsbmuxDevice] = []
+    private var adbDevices: [UsbmuxDevice] = []
     // `-host x.x.x.x` / `-port n` bypass usbmuxd with a manual TCP endpoint
     // (debugging escape hatch, e.g. an iproxy or SSH tunnel).
     @Published var host = UserDefaults.standard.string(forKey: "host") ?? "127.0.0.1"
@@ -226,6 +230,7 @@ final class SenderController: ObservableObject {
 
     private var browser: NWBrowser?
     private var usbWatcher: UsbmuxDeviceWatcher?
+    private var adbWatcher: AdbDeviceWatcher?
 
     // Connection policy — one session per physical device, and the cable
     // wins whenever it's available (lower, steadier latency than WiFi):
@@ -286,11 +291,12 @@ final class SenderController: ObservableObject {
     init() {
         startBrowsing()
         usbWatcher = UsbmuxDeviceWatcher { [weak self] devices in
-            guard let self else { return }
-            let detached = Set(self.usbDevices.map(\.udid)).subtracting(devices.map(\.udid))
-            self.usbDevices = devices
-            self.failover(detachedUDIDs: detached)
-            self.autoConnect()
+            self?.usbmuxDevices = devices
+            self?.wiredDevicesChanged()
+        }
+        adbWatcher = AdbDeviceWatcher { [weak self] devices in
+            self?.adbDevices = devices
+            self?.wiredDevicesChanged()
         }
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(2))
@@ -448,6 +454,22 @@ final class SenderController: ObservableObject {
         }
     }
 
+    private func wiredDevicesChanged() {
+        let devices = usbmuxDevices + adbDevices
+        let detached = Set(usbDevices.map(\.udid)).subtracting(devices.map(\.udid))
+        usbDevices = devices
+        failover(detachedUDIDs: detached)
+        autoConnect()
+    }
+
+    /// How to dial a cabled device: usbmuxd, or an adb forward for Android.
+    private func wiredTransport(udid: String?, port: UInt16) -> SenderTransport {
+        if let serial = udid.flatMap(AdbParsing.serial(fromUDID:)) {
+            return .adb(serial: serial, port: port)
+        }
+        return .usb(udid: udid, port: port)
+    }
+
     /// Cable plugged in while the device streams over WiFi: migrate the live
     /// session onto USB. No-op when the session is already cabled.
     private func upgradeToUSB(_ session: DeviceSession, device: UsbmuxDevice) {
@@ -458,7 +480,7 @@ final class SenderController: ObservableObject {
         // The match may have been by name only — pin the strong identity so
         // future matching (and the next launch) recognizes the pair.
         if let id = session.deviceID { installIDByUDID[device.udid] = id }
-        session.sender.switchTransport(to: .usb(udid: device.udid, port: portNum))
+        session.sender.switchTransport(to: wiredTransport(udid: device.udid, port: portNum))
     }
 
     /// Cable unplugged under a live session: fail over to the device's WiFi
@@ -542,7 +564,8 @@ final class SenderController: ObservableObject {
             if let device = usbDevices.first(where: { $0.udid == udid }), let name = device.name {
                 return name
             }
-            return udid == nil ? "Manual (\(host):\(port))" : "iPhone / iPad"
+            if udid == nil { return "Manual (\(host):\(port))" }
+            return udid.flatMap(AdbParsing.serial(fromUDID:)) == nil ? "iPhone / iPad" : "Android device"
         case .wifi(let result):
             return serviceName(of: result) ?? "WiFi device"
         }
@@ -618,7 +641,7 @@ final class SenderController: ObservableObject {
                 transport = .tcp(.hostPort(host: NWEndpoint.Host(host),
                                            port: NWEndpoint.Port(rawValue: portNum)!))
             } else {
-                transport = .usb(udid: udid, port: portNum)
+                transport = wiredTransport(udid: udid, port: portNum)
             }
         case .wifi(let result):
             transport = .tcp(result.endpoint)
@@ -816,7 +839,7 @@ final class SenderController: ObservableObject {
                 name: device.name
                     ?? twin.flatMap(serviceName)
                     ?? session(for: usbTarget.sessionID)?.deviceKind
-                    ?? "iPhone / iPad",
+                    ?? label(for: usbTarget),
                 usbTarget: usbTarget,
                 wifiTarget: twin.map { .wifi($0) }))
         }
