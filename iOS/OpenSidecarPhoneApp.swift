@@ -69,7 +69,7 @@ struct ReceiverScreen: View {
     }
 
     var body: some View {
-        GeometryReader { geo in
+        GeometryReader { _ in
             ZStack {
                 if isStreaming {
                     Color.black.ignoresSafeArea()
@@ -91,9 +91,10 @@ struct ReceiverScreen: View {
                     IdleView(receiver: model.receiver, showSettings: $showSettings)
                 }
             }
-            .onAppear { model.receiver.setOrientation(portrait: geo.size.height > geo.size.width) }
-            .onChange(of: geo.size) { size in
-                model.receiver.setOrientation(portrait: size.height > size.width)
+            .background {
+                ReceiverPanelObserver(model: model)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
             }
             .sheet(isPresented: $showOnboarding) {
                 OnboardingView { onboardingDismissed = true }
@@ -540,7 +541,10 @@ private struct DeviceNameField: View {
 @MainActor
 final class ReceiverModel: ObservableObject {
     let receiver: StreamReceiver
+    private let decodesHEVC: Bool
     private var started = false
+    private var listenerRefreshRequested = false
+    private weak var panelWindow: UIWindow?
     private var cancellables = Set<AnyCancellable>()
 
     init() {
@@ -549,7 +553,8 @@ final class ReceiverModel: ObservableObject {
         // buys quality per bit, which matters most over WiFi. Bounded by the
         // panel in either orientation, so a large mirrored Mac display is
         // scaled to what this screen can show instead of sent in full.
-        let native = UIScreen.main.nativeBounds.size   // portrait pixels
+        let screen = UIScreen.main
+        let native = screen.nativeBounds.size
         let longSide = Int(max(native.width, native.height))
         var decodesHEVC = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
         #if DEBUG
@@ -557,6 +562,7 @@ final class ReceiverModel: ObservableObject {
         // the HEVC receive path there with software decode.
         if UserDefaults.standard.bool(forKey: "forceHEVCOffer") { decodesHEVC = true }
         #endif
+        self.decodesHEVC = decodesHEVC
         let hevc = decodesHEVC
             ? VideoCapability(codec: "hevc", maxWidth: longSide, maxHeight: longSide,
                               maxFrameRate: 60)
@@ -565,11 +571,13 @@ final class ReceiverModel: ObservableObject {
                                   deviceKind: deviceKind,
                                   fallbackServiceName: UIDevice.current.name,
                                   hevcCapability: hevc)
-        // Announce the native panel size to the Mac.
+        // Fallback until the view is attached to its actual window. The
+        // window observer then follows folding, rotation, and scene resizing.
         receiver.setNativePanel(long: Int(max(native.width, native.height)),
                                 short: Int(min(native.width, native.height)),
-                                scale: Double(UIScreen.main.nativeScale))
-        receiver.setDisplayMaxFrameRate(UIScreen.main.maximumFramesPerSecond)
+                                scale: Double(screen.nativeScale))
+        receiver.setOrientation(portrait: screen.bounds.height > screen.bounds.width)
+        receiver.setDisplayMaxFrameRate(screen.maximumFramesPerSecond)
         if let budget = DecodeBudget.maxPixelsPerSecond(model: DecodeBudget.currentModel) {
             receiver.setDecodeBudget(maxPixelsPerSecond: budget)
         }
@@ -582,9 +590,58 @@ final class ReceiverModel: ObservableObject {
     }
 
     func start() {
-        guard !started else { return }
-        started = true
-        receiver.start(port: 9000)
+        // onAppear/scene activation can precede attachment of the observer.
+        // Never accept a connection using the initializer's fallback panel.
+        listenerRefreshRequested = true
+        if let geometry = currentWindowPanel() { applyWindowPanel(geometry) }
+    }
+
+    func bindPanelWindow(_ window: UIWindow) {
+        panelWindow = window
+    }
+
+    func unbindPanelWindow(_ window: UIWindow) {
+        if panelWindow === window { panelWindow = nil }
+    }
+
+    func currentWindowPanel() -> ReceiverPanelGeometry? {
+        guard let window = panelWindow, let scene = window.windowScene,
+              scene.activationState != .background,
+              scene.activationState != .unattached else { return nil }
+        return ReceiverPanelGeometry.make(
+            pointsWide: Double(window.bounds.width),
+            pointsHigh: Double(window.bounds.height),
+            nativeScale: Double(scene.screen.nativeScale),
+            maximumFramesPerSecond: scene.screen.maximumFramesPerSecond,
+            screenSize: scene.screen.bounds.size,
+            nativePixelSize: scene.screen.nativeBounds.size)
+    }
+
+    func applyWindowPanel(_ geometry: ReceiverPanelGeometry) {
+        // Keep the upstream HEVC offer bounded by the current drawable's long
+        // edge in either orientation. A cap captured on the outer display
+        // would otherwise keep constraining the stream after unfolding.
+        let longSide = max(geometry.pixelsWide, geometry.pixelsHigh)
+        let hevc = decodesHEVC
+            ? VideoCapability(codec: "hevc", maxWidth: longSide, maxHeight: longSide,
+                              maxFrameRate: 60)
+            : nil
+        let limitsChanged = receiver.setDecodeLimits(maxEncodeWide: nil,
+                                                     maxEncodeHigh: nil,
+                                                     hevc: hevc)
+        receiver.setPanel(pixelsWide: geometry.pixelsWide,
+                          pixelsHigh: geometry.pixelsHigh,
+                          scale: geometry.scale,
+                          limitsChanged: limitsChanged)
+        receiver.setDisplayMaxFrameRate(geometry.maximumFramesPerSecond)
+        guard listenerRefreshRequested else { return }
+        listenerRefreshRequested = false
+        if started {
+            receiver.ensureListening()
+        } else {
+            started = true
+            receiver.start(port: 9000)
+        }
     }
 
     // MARK: - Lock vs app switch vs app quit
@@ -620,7 +677,8 @@ final class ReceiverModel: ObservableObject {
     func sceneDidActivate() {
         endBackgroundAssertion()
         receiver.setRenderingPaused(false)
-        receiver.ensureListening()
+        // Refresh the owning window before allowing a wake/reconnect hello.
+        start()
     }
 
     func deviceWillLock() {
@@ -684,6 +742,135 @@ extension UIEvent {
     func samples(for touch: UITouch) -> [UITouch] {
         let batch = coalescedTouches(for: touch) ?? []
         return batch.isEmpty ? [touch] : batch
+    }
+}
+
+// MARK: - Receiver window geometry
+
+/// Observe the window that owns this receiver, rather than a global screen or
+/// the safe-area-reduced SwiftUI layout. The window's full bounds are stable
+/// when the keyboard, settings sheet, or streaming overlays appear.
+private struct ReceiverPanelObserver: UIViewRepresentable {
+    let model: ReceiverModel
+
+    func makeUIView(context: Context) -> PanelView {
+        let view = PanelView()
+        view.model = model
+        view.isUserInteractionEnabled = false
+        return view
+    }
+
+    func updateUIView(_ view: PanelView, context: Context) {
+        view.scheduleRefresh()
+    }
+
+    static func dismantleUIView(_ view: PanelView, coordinator: ()) {
+        view.stopObserving()
+    }
+
+    final class PanelView: UIView {
+        weak var model: ReceiverModel?
+        private weak var observedWindow: UIWindow?
+        private var observers = Set<AnyCancellable>()
+        private var pendingRefresh: DispatchWorkItem?
+        private var pendingGeometry: ReceiverPanelGeometry?
+        private var lastReportedGeometry: ReceiverPanelGeometry?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            guard let window else {
+                stopObserving()
+                return
+            }
+            if let previous = observedWindow, previous !== window {
+                model?.unbindPanelWindow(previous)
+            }
+            observedWindow = window
+            model?.bindPanelWindow(window)
+            if observers.isEmpty {
+                NotificationCenter.default.publisher(for: UIScene.didActivateNotification)
+                    .sink { [weak self] notification in
+                        guard let self,
+                              let scene = notification.object as? UIWindowScene,
+                              scene === self.window?.windowScene else { return }
+                        self.scheduleRefresh()
+                    }
+                    .store(in: &observers)
+                NotificationCenter.default.publisher(for: UIScreen.modeDidChangeNotification)
+                    .sink { [weak self] notification in
+                        guard let self,
+                              let screen = notification.object as? UIScreen,
+                              screen === self.window?.windowScene?.screen else { return }
+                        self.scheduleRefresh()
+                    }
+                    .store(in: &observers)
+            }
+            scheduleRefresh()
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            scheduleRefresh()
+        }
+
+        override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+            super.traitCollectionDidChange(previousTraitCollection)
+            // Scene geometry/display changes propagate through this view's
+            // traits too; never replace SwiftUI's owning scene delegate.
+            scheduleRefresh()
+        }
+
+        func stopObserving() {
+            if let observedWindow { model?.unbindPanelWindow(observedWindow) }
+            observedWindow = nil
+            lastReportedGeometry = nil
+            observers.removeAll()
+            cancelPendingRefresh()
+        }
+
+        private func cancelPendingRefresh() {
+            pendingRefresh?.cancel()
+            pendingRefresh = nil
+            pendingGeometry = nil
+        }
+
+        private func currentGeometry() -> ReceiverPanelGeometry? {
+            model?.currentWindowPanel()
+        }
+
+        func scheduleRefresh() {
+            guard let geometry = currentGeometry(), geometry != lastReportedGeometry else {
+                cancelPendingRefresh()
+                return
+            }
+            if lastReportedGeometry == nil {
+                // The first hello must already contain the real window size.
+                // Only subsequent live transitions need the debounce below.
+                cancelPendingRefresh()
+                lastReportedGeometry = geometry
+                model?.applyWindowPanel(geometry)
+                return
+            }
+            guard geometry != pendingGeometry else { return }
+            cancelPendingRefresh()
+            pendingGeometry = geometry
+            // Let a fold/rotation settle before announcing a new desktop.
+            // Repeated layouts of the same size do not postpone the update.
+            let refresh = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.pendingRefresh = nil
+                self.pendingGeometry = nil
+                guard let current = self.currentGeometry() else { return }
+                guard current == geometry else {
+                    self.scheduleRefresh()
+                    return
+                }
+                self.lastReportedGeometry = current
+                self.model?.applyWindowPanel(current)
+            }
+            pendingRefresh = refresh
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(150), execute: refresh)
+        }
     }
 }
 
